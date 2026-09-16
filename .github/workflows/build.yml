@@ -1,0 +1,221 @@
+name: Build yggdrasil-jumper
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_VERSION: 25.12.5
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - arm_cortex-a7
+          - arm_cortex-a9
+          - arm_cortex-a15_neon-vfpv4
+
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - rockchip-armv8
+          - aarch64_generic
+
+          - i386_pentium4
+          - x86_64
+
+          - mipsel_24kc
+          - mips_mips32
+          - mips64_octeonplus
+
+          - riscv64_generic
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Verify package
+        shell: bash
+        run: |
+          set -e
+
+          test -f yggdrasil-jumper/Makefile
+
+          echo "Package:"
+          grep '^PKG_NAME:=' yggdrasil-jumper/Makefile
+
+          echo "Version:"
+          grep '^PKG_VERSION:=' yggdrasil-jumper/Makefile
+
+          echo "Release:"
+          grep '^PKG_RELEASE:=' yggdrasil-jumper/Makefile
+
+      - name: Build yggdrasil-jumper
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}-${{ env.OPENWRT_VERSION }}
+          FEEDNAME: action
+          PACKAGES: yggdrasil-jumper
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          BUILD_LOG: 1
+          V: s
+
+      - name: Show build result
+        shell: bash
+        run: |
+          set -e
+
+          echo "Built packages:"
+          find bin/packages \
+            -type f \
+            \( -name '*.apk' -o -name '*.ipk' \) \
+            -print \
+            | sort
+
+      - name: Find APK
+        id: apk
+        shell: bash
+        run: |
+          set -e
+
+          APK="$(find bin/packages \
+            -type f \
+            -name 'yggdrasil-jumper-*.apk' \
+            | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: yggdrasil-jumper APK not found"
+            echo
+            echo "All generated packages:"
+            find bin/packages \
+              -type f \
+              \( -name '*.apk' -o -name '*.ipk' \) \
+              -print \
+              | sort || true
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$APK"
+
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare APK
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p release
+
+          cp "${{ steps.apk.outputs.path }}" \
+            "release/yggdrasil-jumper-${{ matrix.arch }}.apk"
+
+          echo "Release package:"
+          ls -lh release/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggdrasil-jumper-${{ matrix.arch }}
+          path: release/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggdrasil-jumper-build-log-${{ matrix.arch }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish packages
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: yggdrasil-jumper-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify APKs
+        shell: bash
+        run: |
+          set -e
+
+          echo "Packages:"
+          find release \
+            -type f \
+            -name '*.apk' \
+            -print \
+            | sort
+
+          COUNT="$(find release \
+            -type f \
+            -name '*.apk' \
+            | wc -l)"
+
+          echo
+          echo "Found $COUNT APK(s)"
+
+          if [ "$COUNT" -ne 13 ]; then
+            echo "ERROR: Expected 13 APKs"
+            exit 1
+          fi
+
+      - name: Verify architectures
+        shell: bash
+        run: |
+          set -e
+
+          for ARCH in \
+            arm_cortex-a7 \
+            arm_cortex-a9 \
+            arm_cortex-a15_neon-vfpv4 \
+            aarch64_cortex-a53 \
+            aarch64_cortex-a72 \
+            rockchip-armv8 \
+            aarch64_generic \
+            i386_pentium4 \
+            x86_64 \
+            mipsel_24kc \
+            mips_mips32 \
+            mips64_octeonplus \
+            riscv64_generic
+          do
+            FILE="release/yggdrasil-jumper-${ARCH}.apk"
+
+            if [ ! -f "$FILE" ]; then
+              echo "ERROR: Missing package for $ARCH"
+              exit 1
+            fi
+          done
+
+          echo "All 13 architectures are present."
+
+      - name: Publish APKs to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            release/*.apk
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
