@@ -16,7 +16,6 @@ env:
   OPENWRT_VERSION: "25.12.5"
   FEED_BRANCH: gh-pages
   FEED_ROOT: "25.12"
-  UPSTREAM_REPOSITORY: one-d-wide/yggdrasil-jumper
 
 jobs:
   check:
