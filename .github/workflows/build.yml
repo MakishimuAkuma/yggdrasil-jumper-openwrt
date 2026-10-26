@@ -191,6 +191,20 @@ jobs:
           git diff --check
           git diff -- "$makefile"
 
+      - name: Debug package Makefile
+        shell: bash
+        run: |
+          set -eu
+          echo "=== PKG_SOURCE_URL ==="
+          grep -n '^PKG_SOURCE_URL' yggdrasil-jumper/Makefile || true
+
+          echo "=== PKG_HASH ==="
+          grep -n '^PKG_HASH' yggdrasil-jumper/Makefile || true
+
+          echo "=== Package metadata ==="
+          grep -nE '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_SOURCE|PKG_SOURCE_URL|PKG_HASH):=' \
+            yggdrasil-jumper/Makefile
+
       - name: Commit updated Makefile
         id: commit
         shell: bash
