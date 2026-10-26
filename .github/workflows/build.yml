@@ -14,6 +14,8 @@ concurrency:
 
 env:
   OPENWRT_VERSION: "25.12.5"
+  FEED_BRANCH: gh-pages
+  FEED_ROOT: "25.12"
   UPSTREAM_REPOSITORY: one-d-wide/yggdrasil-jumper
 
 jobs:
@@ -27,16 +29,17 @@ jobs:
       hash: ${{ steps.check.outputs.hash }}
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout package feed
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
 
-      - name: Check runner dependencies
+      - name: Check runner prerequisites
         shell: bash
         run: |
           set -euo pipefail
-          for cmd in curl jq git sha256sum docker; do
+          for cmd in docker curl jq git sha256sum openssl; do
             command -v "$cmd"
           done
           docker info >/dev/null
@@ -55,16 +58,16 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' \
             "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/latest")"
 
-          tag="$(jq -er '.tag_name' <<<"$upstream_json")"
+          tag="$(jq -er '.tag_name' <<< "$upstream_json")"
           version="${tag#v}"
 
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "ERROR: Unexpected upstream release tag: $tag"
+            echo "ERROR: Unexpected upstream tag: $tag"
             exit 1
           fi
 
           if [ "$tag" != "v${version}" ]; then
-            echo "ERROR: Expected upstream tag v${version}, got $tag"
+            echo "ERROR: Expected tag v${version}, got $tag"
             exit 1
           fi
 
@@ -72,64 +75,65 @@ jobs:
           current="$(sed -n 's/^PKG_VERSION:=//p' "$makefile" | head -n 1)"
           test -n "$current"
 
-          echo "Upstream stable: $version ($tag)"
+          echo "Upstream version: $version"
           echo "Makefile version: $current"
 
-          release_file="$RUNNER_TEMP/current-release.json"
+          release_file="$RUNNER_TEMP/releases.json"
           status="$(curl -sS --retry 5 --retry-delay 2 \
             -o "$release_file" -w '%{http_code}' \
             -H 'Accept: application/vnd.github+json' \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest")"
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
 
           build=false
 
           if [ "$status" = "200" ]; then
-            current_tag="$(jq -r '.tag_name // ""' "$release_file")"
-            current_version="${current_tag#v}"
+            current_tag="$(jq -r \
+              '[.[] | select(.draft == false and .prerelease == false)
+               | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))]
+               | sort_by(.created_at) | last | .tag_name // ""' \
+              "$release_file")"
 
-            if ! [[ "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-              echo "ERROR: Unexpected repository release tag: $current_tag"
-              exit 1
-            fi
-
-            newest="$(printf '%s\n' "$current_version" "$version" | sort -V | tail -n 1)"
-
-            if [ "$newest" != "$current_version" ]; then
-              echo "New upstream release: $current_tag -> $tag"
+            if [ -z "$current_tag" ]; then
               build=true
+              echo "No previous stable package release found."
             else
-              echo "Repository release $current_tag already covers $tag."
+              current_version="${current_tag#v}"
+              echo "Latest package release: $current_tag"
+
+              newest="$(printf '%s\n' "$current_version" "$version" | sort -V | tail -n 1)"
+              if [ "$newest" != "$current_version" ]; then
+                build=true
+                echo "New upstream release: $current_tag -> $tag"
+              else
+                echo "No newer upstream release."
+              fi
             fi
-          elif [ "$status" = "404" ]; then
-            echo "No existing release; first build."
-            build=true
           else
-            echo "ERROR: GitHub Releases API returned HTTP $status"
+            echo "ERROR: Releases API returned HTTP $status"
             cat "$release_file" || true
             exit 1
           fi
 
-          if [ "$build" = "true" ] && [ "$current" != "$version" ]; then
+          if [ "$build" = true ] && [ "$current" != "$version" ]; then
             newest="$(printf '%s\n' "$current" "$version" | sort -V | tail -n 1)"
             if [ "$newest" = "$current" ]; then
-              echo "Local package version $current is newer; skipping downgrade."
+              echo "Makefile version $current is newer than upstream $version; skipping downgrade."
               build=false
             fi
           fi
 
           hash=""
-          if [ "$build" = "true" ]; then
+          if [ "$build" = true ]; then
             source_url="https://codeload.github.com/${UPSTREAM_REPOSITORY}/tar.gz/v${version}?"
             tmp="$(mktemp)"
             trap 'rm -f "$tmp"' EXIT
 
             curl -fL --retry 5 --retry-delay 2 "$source_url" -o "$tmp"
             hash="$(sha256sum "$tmp" | awk '{print $1}')"
-
             [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
-            echo "Source URL: $source_url"
+
             echo "Source SHA256: $hash"
           fi
 
@@ -141,7 +145,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   update-makefile:
-    name: Update package version and hash
+    name: Update package version and source hash
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: [self-hosted, Linux, X64]
@@ -149,7 +153,8 @@ jobs:
       sha: ${{ steps.commit.outputs.sha }}
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout package feed
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
@@ -157,26 +162,32 @@ jobs:
       - name: Update Makefile
         shell: bash
         env:
-          JUMPER_VERSION: ${{ needs.check.outputs.version }}
-          JUMPER_HASH: ${{ needs.check.outputs.hash }}
+          VERSION: ${{ needs.check.outputs.version }}
+          HASH: ${{ needs.check.outputs.hash }}
         run: |
           set -euo pipefail
 
           makefile="yggdrasil-jumper/Makefile"
           test -f "$makefile"
-          test -n "$JUMPER_VERSION"
-          test -n "$JUMPER_HASH"
+          test -n "$VERSION"
+          test -n "$HASH"
 
           grep -q '^PKG_VERSION:=' "$makefile"
+          grep -q '^PKG_SOURCE_URL:=' "$makefile"
           grep -q '^PKG_HASH:=' "$makefile"
 
+          source_url="https://codeload.github.com/one-d-wide/yggdrasil-jumper/tar.gz/v${VERSION}?"
+
           sed -i \
-            -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${JUMPER_VERSION}/" \
-            -e "s/^PKG_HASH:=.*/PKG_HASH:=${JUMPER_HASH}/" \
+            -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" \
+            -e "s#^PKG_SOURCE_URL:=.*#PKG_SOURCE_URL:=${source_url}#" \
+            -e "s/^PKG_HASH:=.*/PKG_HASH:=${HASH}/" \
             "$makefile"
 
-          grep -Fqx "PKG_VERSION:=${JUMPER_VERSION}" "$makefile"
-          grep -Fqx "PKG_HASH:=${JUMPER_HASH}" "$makefile"
+          grep -Fqx "PKG_VERSION:=${VERSION}" "$makefile"
+          grep -Fqx "PKG_SOURCE_URL:=${source_url}" "$makefile"
+          grep -Fqx "PKG_HASH:=${HASH}" "$makefile"
+
           git diff --check
           git diff -- "$makefile"
 
@@ -186,7 +197,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          JUMPER_VERSION: ${{ needs.check.outputs.version }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -195,7 +206,8 @@ jobs:
 
           if ! git diff --quiet -- yggdrasil-jumper/Makefile; then
             git add yggdrasil-jumper/Makefile
-            git commit -m "Update yggdrasil-jumper to ${JUMPER_VERSION}"
+            git commit -m "Update yggdrasil-jumper to ${VERSION}"
+
             git push \
               "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
               "HEAD:${DEFAULT_BRANCH}"
@@ -215,13 +227,14 @@ jobs:
       count: ${{ steps.arch.outputs.count }}
 
     steps:
-      - name: Discover architectures
+      - name: Discover supported architectures
         id: arch
         shell: bash
         run: |
           set -euo pipefail
 
           base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/packages"
+
           candidates=(
             arm_cortex-a5_vfpv4
             arm_cortex-a7
@@ -236,6 +249,8 @@ jobs:
             aarch64_cortex-a76
             aarch64_generic
             rockchip-armv8
+            i386_pentium4
+            x86_64
             mips_24kc
             mips_4kec
             mips_mips32
@@ -246,51 +261,51 @@ jobs:
             mips64_octeonplus
             riscv64_generic
             loongarch64_generic
-            i386_pentium4
-            x86_64
           )
 
-          arches=()
+          archs=()
           for arch in "${candidates[@]}"; do
             if curl -fsSL --head --max-time 15 "${base}/${arch}/" >/dev/null 2>&1; then
-              arches+=("$arch")
+              archs+=("$arch")
             else
               echo "Skipping unavailable architecture: $arch"
             fi
           done
 
-          if [ "${#arches[@]}" -eq 0 ]; then
+          if [ "${#archs[@]}" -eq 0 ]; then
             echo "ERROR: No OpenWrt package architectures found."
             exit 1
           fi
 
-          matrix="$(printf '%s\n' "${arches[@]}" |
+          matrix="$(printf '%s\n' "${archs[@]}" |
             jq -Rsc '{arch: split("\n") | map(select(length > 0))}')"
 
           echo "$matrix" | jq .
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "count=${#arches[@]}" >> "$GITHUB_OUTPUT"
+          echo "count=${#archs[@]}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.arch }}
     needs: [check, update-makefile, discover]
     if: needs.check.outputs.build == 'true'
     runs-on: [self-hosted, Linux, X64]
+
     strategy:
       fail-fast: false
       matrix:
         arch: ${{ fromJSON(needs.discover.outputs.matrix).arch }}
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout updated package
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.update-makefile.outputs.sha }}
           fetch-depth: 1
 
-      - name: Verify package metadata
+      - name: Verify package files
         shell: bash
         env:
-          EXPECTED_VERSION: ${{ needs.check.outputs.version }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -298,97 +313,229 @@ jobs:
           test -f "$makefile"
 
           grep -Fqx 'PKG_NAME:=yggdrasil-jumper' "$makefile"
-          grep -Fqx "PKG_VERSION:=${EXPECTED_VERSION}" "$makefile"
+          grep -Fqx "PKG_VERSION:=${VERSION}" "$makefile"
           grep -q '^PKG_RELEASE:=' "$makefile"
           grep -Fqx 'PKG_SOURCE_URL:=https://codeload.github.com/one-d-wide/yggdrasil-jumper/tar.gz/v$(PKG_VERSION)?' "$makefile"
           grep -Eq '^PKG_HASH:=[0-9a-f]{64}$' "$makefile"
 
-          grep '^PKG_NAME:=' "$makefile"
-          grep '^PKG_VERSION:=' "$makefile"
-          grep '^PKG_RELEASE:=' "$makefile"
-          grep '^PKG_HASH:=' "$makefile"
+      - name: Prepare SDK directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$GITHUB_WORKSPACE/feed"
+          chmod -R 0777 "$GITHUB_WORKSPACE/artifacts" "$GITHUB_WORKSPACE/feed"
 
-      - name: Build yggdrasil-jumper
+      - name: Build and sign yggdrasil-jumper APK
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: ${{ matrix.arch }}-${{ env.OPENWRT_VERSION }}
           FEEDNAME: action
           PACKAGES: yggdrasil-jumper
+          INDEX: 1
+          PRIVATE_KEY: ${{ secrets.APK_SIGNING_KEY }}
+          ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+          FEED_DIR: ${{ github.workspace }}/feed
           NO_REFRESH_CHECK: 1
           NO_SHFMT_CHECK: 1
           BUILD_LOG: 1
           V: s
 
-      - name: Find and prepare APK
-        id: apk
+      - name: Collect APK and signed feed index
+        id: collect
         shell: bash
         env:
-          PACKAGE_VERSION: ${{ needs.check.outputs.version }}
-          TARGET_ARCH: ${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
 
-          apk="$(find bin -type f -name 'yggdrasil-jumper-*.apk' -print -quit)"
+          apk="$(find artifacts feed bin -type f \
+            -name 'yggdrasil-jumper-*.apk' -print -quit 2>/dev/null || true)"
+
           if [ -z "$apk" ]; then
             echo "ERROR: yggdrasil-jumper APK not found."
-            find bin -type f \( -name '*.apk' -o -name '*.ipk' \) -print | sort || true
+            find artifacts feed bin -type f \
+              \( -name '*.apk' -o -name 'packages.adb' \) -print 2>/dev/null | sort || true
             exit 1
           fi
 
-          mkdir -p release
-          output="release/yggdrasil-jumper-${PACKAGE_VERSION}-${TARGET_ARCH}.apk"
-          cp "$apk" "$output"
-          test -s "$output"
+          index="$(find artifacts feed bin -type f \
+            -name 'packages.adb' -print -quit 2>/dev/null || true)"
 
-          echo "path=$output" >> "$GITHUB_OUTPUT"
-          ls -lh "$output"
+          if [ -z "$index" ]; then
+            echo "ERROR: packages.adb not found; SDK feed index was not generated."
+            exit 1
+          fi
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v7
+          mkdir -p "publish/apk" "publish/feed/${ARCH}"
+
+          apk_name="$(basename "$apk")"
+          cp "$apk" "publish/feed/${ARCH}/${apk_name}"
+          cp "$apk" "publish/apk/yggdrasil-jumper-${VERSION}-${ARCH}.apk"
+          cp "$index" "publish/feed/${ARCH}/packages.adb"
+
+          test -s "publish/apk/yggdrasil-jumper-${VERSION}-${ARCH}.apk"
+          test -s "publish/feed/${ARCH}/packages.adb"
+
+          echo "Collected APK and index for ${ARCH}:"
+          find "publish" -type f -print | sort
+
+      - name: Upload architecture artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: yggdrasil-jumper-${{ matrix.arch }}
-          path: ${{ steps.apk.outputs.path }}
+          path: publish/
           if-no-files-found: error
           retention-days: 7
 
   release:
-    name: Publish packages
+    name: Publish signed APKs and feed
     needs: [check, discover, build]
     if: needs.check.outputs.build == 'true'
     runs-on: [self-hosted, Linux, X64]
 
     steps:
-      - name: Download APK artifacts
-        uses: actions/download-artifact@v7
+      - name: Download architecture artifacts
+        uses: actions/download-artifact@v4
         with:
           pattern: yggdrasil-jumper-*
-          path: release
+          path: release-artifacts
           merge-multiple: true
 
-      - name: Verify APKs
+      - name: Generate public signing key
         shell: bash
         env:
-          EXPECTED_COUNT: ${{ needs.discover.outputs.count }}
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
         run: |
           set -euo pipefail
 
-          count="$(find release -type f -name '*.apk' | wc -l | tr -d ' ')"
-          echo "Expected APKs: ${EXPECTED_COUNT}"
-          echo "Found APKs: ${count}"
-          find release -type f -name '*.apk' -print | sort
-          test "$count" -eq "$EXPECTED_COUNT"
+          if [ -z "${APK_SIGNING_KEY:-}" ]; then
+            echo "ERROR: Repository secret APK_SIGNING_KEY is empty or missing."
+            exit 1
+          fi
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.check.outputs.tag }}
-          name: yggdrasil-jumper ${{ needs.check.outputs.version }} (OpenWrt 25.12)
-          generate_release_notes: true
-          files: |
-            release/*.apk
-          fail_on_unmatched_files: true
+          printf '%s\n' "$APK_SIGNING_KEY" > "$RUNNER_TEMP/apk-signing-key.pem"
+          chmod 600 "$RUNNER_TEMP/apk-signing-key.pem"
+
+          openssl pkey \
+            -in "$RUNNER_TEMP/apk-signing-key.pem" \
+            -pubout \
+            -out yggdrasil-jumper-feed.pub.pem
+
+          rm -f "$RUNNER_TEMP/apk-signing-key.pem"
+          test -s yggdrasil-jumper-feed.pub.pem
+
+      - name: Verify APKs and feed indexes
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_COUNT: ${{ needs.discover.outputs.count }}
+          ARCH_MATRIX: ${{ needs.discover.outputs.matrix }}
+        run: |
+          set -euo pipefail
+
+          expected_apks=$((EXPECTED_COUNT))
+          found_apks="$(find release-artifacts/apk -type f -name '*.apk' | wc -l | tr -d ' ')"
+
+          echo "Expected APKs: $expected_apks"
+          echo "Found APKs: $found_apks"
+          test "$found_apks" -eq "$expected_apks"
+
+          while IFS= read -r arch; do
+            test -n "$arch"
+            test -s "release-artifacts/feed/${arch}/packages.adb"
+
+            if ! find "release-artifacts/feed/${arch}" -maxdepth 1 \
+              -type f -name 'yggdrasil-jumper-*.apk' | grep -q .; then
+              echo "ERROR: No feed APK found for ${arch}"
+              exit 1
+            fi
+          done < <(jq -r '.arch[]' <<< "$ARCH_MATRIX")
+
+          find release-artifacts -type f -print | sort
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.check.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          command -v gh
+
+          shopt -s nullglob
+          files=(release-artifacts/apk/*.apk yggdrasil-jumper-feed.pub.pem)
+
+          if [ "${#files[@]}" -lt 2 ]; then
+            echo "ERROR: Release APKs or public key are missing."
+            exit 1
+          fi
+
+          if ! gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --title "yggdrasil-jumper ${RELEASE_VERSION} (OpenWrt 25.12)" \
+              --generate-notes
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            "${files[@]}" \
+            --repo "$GH_REPO" \
+            --clobber
+
+      - name: Publish feed to gh-pages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH_MATRIX: ${{ needs.discover.outputs.matrix }}
+        run: |
+          set -euo pipefail
+
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --heads "$remote" "$FEED_BRANCH" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "$FEED_BRANCH" "$remote" "$work/repo"
+          else
+            mkdir -p "$work/repo"
+            git -C "$work/repo" init
+            git -C "$work/repo" checkout --orphan "$FEED_BRANCH"
+            git -C "$work/repo" remote add origin "$remote"
+          fi
+
+          repo="$work/repo"
+          mkdir -p "$repo/$FEED_ROOT"
+
+          while IFS= read -r arch; do
+            test -n "$arch"
+            target="$repo/$FEED_ROOT/$arch"
+
+            rm -rf "$target"
+            mkdir -p "$target"
+            cp -a "release-artifacts/feed/${arch}/." "$target/"
+          done < <(jq -r '.arch[]' <<< "$ARCH_MATRIX")
+
+          cp yggdrasil-jumper-feed.pub.pem \
+            "$repo/$FEED_ROOT/yggdrasil-jumper-feed.pub.pem"
+
+          touch "$repo/.nojekyll"
+
+          cd "$repo"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FEED_ROOT" .nojekyll
+
+          if git diff --cached --quiet; then
+            echo "Feed is already up to date."
+            exit 0
+          fi
+
+          git commit -m "Publish yggdrasil-jumper ${{ needs.check.outputs.tag }} APK feed"
+          git push origin "HEAD:${FEED_BRANCH}"
 
   skip:
     name: No new stable release
@@ -400,7 +547,7 @@ jobs:
       - name: Show status
         shell: bash
         env:
-          UPSTREAM_VERSION: ${{ needs.check.outputs.version }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          echo "No new yggdrasil-jumper stable release needs to be built."
-          echo "Latest upstream: ${UPSTREAM_VERSION}"
+          echo "No new yggdrasil-jumper release needs to be built."
+          echo "Latest upstream: ${VERSION}"
