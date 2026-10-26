@@ -5,7 +5,7 @@ PKG_VERSION:=0.4.2
 PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://codeload.github.com/one-d-wide/yggdrasil-jumper/tar.gz/v0.4.2?
+PKG_SOURCE_URL:=https://codeload.github.com/one-d-wide/yggdrasil-jumper/tar.gz/v$(PKG_VERSION)?
 PKG_HASH:=3125a7df10021af83f247df5610c259d230c058ea9ecef5587d0bba4dbbfa07a
 
 PKG_MAINTAINER:=Remy D. Farley <one-d-wide@protonmail.com>
