@@ -1,63 +1,232 @@
-name: Build yggdrasil-jumper
+name: Build yggdrasil-jumper OpenWrt 25.12 APKs
 
 on:
-  release:
-    types:
-      - published
+  schedule:
+    - cron: "0 0 */2 * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  OPENWRT_VERSION: 25.12.5
+  OPENWRT_VERSION: "25.12.5"
+  UPSTREAM_REPOSITORY: one-d-wide/yggdrasil-jumper
 
 jobs:
+  check:
+    name: Check upstream stable release
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      hash: ${{ steps.check.outputs.hash }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Check runner dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v curl
+          command -v jq
+          command -v git
+          command -v sha256sum
+          command -v docker
+
+      - name: Check latest stable upstream release
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream_json="$(curl -fsSL --retry 5 --retry-delay 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/latest")"
+          tag="$(jq -er '.tag_name' <<<"$upstream_json")"
+          version="${tag#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Unexpected upstream release tag: $tag"
+            exit 1
+          fi
+
+          current="$(sed -n 's/^PKG_VERSION:=//p' yggdrasil-jumper/Makefile | head -n 1)"
+          test -n "$current"
+          echo "Upstream stable: $version ($tag)"
+          echo "Package Makefile version: $current"
+
+          status="$(curl -sS --retry 5 --retry-delay 2 \
+            -o "$RUNNER_TEMP/current-release.json" -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest")"
+          build=false
+          if [ "$status" = 200 ]; then
+            current_tag="$(jq -r '.tag_name // ""' "$RUNNER_TEMP/current-release.json")"
+            current_version="${current_tag#v}"
+            test -n "$current_version"
+            if [ "$(printf '%s\n' "$current_version" "$version" | sort -V | tail -n1)" != "$current_version" ]; then
+              echo "New upstream release: $current_tag -> $tag"
+              build=true
+            else
+              echo "Latest package release $current_tag already covers upstream $tag."
+            fi
+          elif [ "$status" = 404 ]; then
+            echo "No package release found; this appears to be the first build."
+            build=true
+          else
+            echo "ERROR: Unexpected GitHub Releases API status: $status"
+            cat "$RUNNER_TEMP/current-release.json" || true
+            exit 1
+          fi
+
+          if [ "$build" = true ] && \
+             [ "$(printf '%s\n' "$current" "$version" | sort -V | tail -n1)" = "$current" ] && \
+             [ "$current" != "$version" ]; then
+            echo "Local package version $current is newer than upstream $version; skipping."
+            build=false
+          fi
+
+          hash=""
+          if [ "$build" = true ]; then
+            url="https://github.com/${UPSTREAM_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
+            tmp="$(mktemp)"
+            trap 'rm -f "$tmp"' EXIT
+            curl -fL --retry 5 --retry-delay 2 "$url" -o "$tmp"
+            hash="$(sha256sum "$tmp" | awk '{print $1}')"
+            echo "Source SHA256: $hash"
+          fi
+          {
+            echo "build=$build"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "hash=$hash"
+          } >> "$GITHUB_OUTPUT"
+
+  update-makefile:
+    name: Update package version and source hash
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Update Makefile
+        shell: bash
+        env:
+          JUMPER_VERSION: ${{ needs.check.outputs.version }}
+          JUMPER_HASH: ${{ needs.check.outputs.hash }}
+        run: |
+          set -euo pipefail
+          test -n "$JUMPER_VERSION"
+          test -n "$JUMPER_HASH"
+          test -f yggdrasil-jumper/Makefile
+          grep -q '^PKG_VERSION:=' yggdrasil-jumper/Makefile
+          grep -Eq '^PKG_(HASH|SOURCE_HASH):=' yggdrasil-jumper/Makefile
+          sed -i -E \
+            -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${JUMPER_VERSION}/" \
+            -e "s/^PKG_HASH:=.*/PKG_HASH:=${JUMPER_HASH}/" \
+            -e "s/^PKG_SOURCE_HASH:=.*/PKG_SOURCE_HASH:=${JUMPER_HASH}/" \
+            yggdrasil-jumper/Makefile
+          grep -q "^PKG_VERSION:=${JUMPER_VERSION}$" yggdrasil-jumper/Makefile
+          if grep -q '^PKG_HASH:=' yggdrasil-jumper/Makefile; then
+            grep -q "^PKG_HASH:=${JUMPER_HASH}$" yggdrasil-jumper/Makefile
+          else
+            grep -q "^PKG_SOURCE_HASH:=${JUMPER_HASH}$" yggdrasil-jumper/Makefile
+          fi
+          git diff --check
+          git diff -- yggdrasil-jumper/Makefile
+
+      - name: Commit updated Makefile
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- yggdrasil-jumper/Makefile; then
+            echo "Makefile is already up to date."
+            exit 0
+          fi
+          git add yggdrasil-jumper/Makefile
+          git commit -m "Update yggdrasil-jumper to ${{ needs.check.outputs.version }}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
+
+  discover:
+    name: Discover OpenWrt architectures
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      matrix: ${{ steps.arch.outputs.matrix }}
+      count: ${{ steps.arch.outputs.count }}
+    steps:
+      - name: Discover architectures
+        id: arch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/packages"
+          candidates=(
+            arm_cortex-a5_vfpv4 arm_cortex-a7 arm_cortex-a7_neon-vfpv4
+            arm_cortex-a8_vfpv3 arm_cortex-a9 arm_cortex-a9_vfpv3-d16
+            arm_cortex-a9_neon arm_cortex-a15_neon-vfpv4
+            aarch64_cortex-a53 aarch64_cortex-a72 aarch64_cortex-a76
+            aarch64_generic rockchip-armv8 mips_24kc mips_4kec mips_mips32
+            mipsel_24kc mipsel_24kc_24kf mipsel_74kc mipsel_mips32
+            mips64_octeonplus riscv64_generic loongarch64_generic i386_pentium4 x86_64
+          )
+          arches=()
+          for arch in "${candidates[@]}"; do
+            if curl -fsSI --max-time 15 "${base}/${arch}/" >/dev/null 2>&1; then
+              arches+=("$arch")
+            else
+              echo "Skipping unavailable architecture: $arch"
+            fi
+          done
+          if [ "${#arches[@]}" -eq 0 ]; then
+            echo "ERROR: No OpenWrt package architectures found."
+            exit 1
+          fi
+          matrix="$(printf '%s\n' "${arches[@]}" | jq -Rsc '{arch: split("\n") | map(select(length > 0))}')"
+          echo "$matrix" | jq .
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=${#arches[@]}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.arch }}
-    runs-on: ubuntu-latest
-
+    needs: [check, update-makefile, discover]
+    if: needs.check.outputs.build == 'true'
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - arm_cortex-a7
-          - arm_cortex-a9
-          - arm_cortex-a15_neon-vfpv4
-
-          - aarch64_cortex-a53
-          - aarch64_cortex-a72
-          - rockchip-armv8
-          - aarch64_generic
-
-          - i386_pentium4
-          - x86_64
-
-          - mipsel_24kc
-          - mips_mips32
-          - mips64_octeonplus
-
-          - riscv64_generic
-
+        arch: ${{ fromJSON(needs.discover.outputs.matrix).arch }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
+          ref: ${{ github.ref_name }}
           fetch-depth: 1
 
       - name: Verify package
         shell: bash
         run: |
-          set -e
-
+          set -euo pipefail
           test -f yggdrasil-jumper/Makefile
-
-          echo "Package:"
+          grep -q '^PKG_NAME:=yggdrasil-jumper$' yggdrasil-jumper/Makefile
+          grep -q '^PKG_VERSION:=${{ needs.check.outputs.version }}$' yggdrasil-jumper/Makefile
           grep '^PKG_NAME:=' yggdrasil-jumper/Makefile
-
-          echo "Version:"
           grep '^PKG_VERSION:=' yggdrasil-jumper/Makefile
-
-          echo "Release:"
           grep '^PKG_RELEASE:=' yggdrasil-jumper/Makefile
 
       - name: Build yggdrasil-jumper
@@ -71,84 +240,40 @@ jobs:
           BUILD_LOG: 1
           V: s
 
-      - name: Show build result
-        shell: bash
-        run: |
-          set -e
-
-          echo "Built packages:"
-          find bin/packages \
-            -type f \
-            \( -name '*.apk' -o -name '*.ipk' \) \
-            -print \
-            | sort
-
-      - name: Find APK
+      - name: Find and prepare APK
         id: apk
         shell: bash
         run: |
-          set -e
-
-          APK="$(find bin/packages \
-            -type f \
-            -name 'yggdrasil-jumper-*.apk' \
-            | head -n 1)"
-
-          if [ -z "$APK" ]; then
-            echo "ERROR: yggdrasil-jumper APK not found"
-            echo
-            echo "All generated packages:"
-            find bin/packages \
-              -type f \
-              \( -name '*.apk' -o -name '*.ipk' \) \
-              -print \
-              | sort || true
+          set -euo pipefail
+          apk="$(find bin -type f -name 'yggdrasil-jumper-*.apk' -print -quit)"
+          if [ -z "$apk" ]; then
+            echo "ERROR: yggdrasil-jumper APK not found."
+            find bin -type f \( -name '*.apk' -o -name '*.ipk' \) -print | sort || true
             exit 1
           fi
-
-          echo "Found:"
-          echo "$APK"
-
-          echo "path=$APK" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare APK
-        shell: bash
-        run: |
-          set -e
-
           mkdir -p release
+          output="release/yggdrasil-jumper-${{ needs.check.outputs.version }}-${{ matrix.arch }}.apk"
+          cp "$apk" "$output"
+          test -s "$output"
+          echo "path=$output" >> "$GITHUB_OUTPUT"
+          ls -lh "$output"
 
-          cp "${{ steps.apk.outputs.path }}" \
-            "release/yggdrasil-jumper-${{ matrix.arch }}.apk"
-
-          echo "Release package:"
-          ls -lh release/
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
         with:
           name: yggdrasil-jumper-${{ matrix.arch }}
-          path: release/*.apk
+          path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: yggdrasil-jumper-build-log-${{ matrix.arch }}
-          path: logs/
-          if-no-files-found: ignore
-          retention-days: 7
-
   release:
-    name: Publish packages
-    needs: build
-    runs-on: ubuntu-latest
-
+    name: Publish packages to this repository
+    needs: [check, discover, build]
+    if: needs.check.outputs.build == 'true'
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Download APK artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: yggdrasil-jumper-*
           path: release
@@ -157,65 +282,33 @@ jobs:
       - name: Verify APKs
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          expected="${{ needs.discover.outputs.count }}"
+          count="$(find release -type f -name '*.apk' | wc -l)"
+          echo "Expected APKs: $expected"
+          echo "Found APKs: $count"
+          find release -type f -name '*.apk' -print | sort
+          test "$count" -eq "$expected"
 
-          echo "Packages:"
-          find release \
-            -type f \
-            -name '*.apk' \
-            -print \
-            | sort
-
-          COUNT="$(find release \
-            -type f \
-            -name '*.apk' \
-            | wc -l)"
-
-          echo
-          echo "Found $COUNT APK(s)"
-
-          if [ "$COUNT" -ne 13 ]; then
-            echo "ERROR: Expected 13 APKs"
-            exit 1
-          fi
-
-      - name: Verify architectures
-        shell: bash
-        run: |
-          set -e
-
-          for ARCH in \
-            arm_cortex-a7 \
-            arm_cortex-a9 \
-            arm_cortex-a15_neon-vfpv4 \
-            aarch64_cortex-a53 \
-            aarch64_cortex-a72 \
-            rockchip-armv8 \
-            aarch64_generic \
-            i386_pentium4 \
-            x86_64 \
-            mipsel_24kc \
-            mips_mips32 \
-            mips64_octeonplus \
-            riscv64_generic
-          do
-            FILE="release/yggdrasil-jumper-${ARCH}.apk"
-
-            if [ ! -f "$FILE" ]; then
-              echo "ERROR: Missing package for $ARCH"
-              exit 1
-            fi
-          done
-
-          echo "All 13 architectures are present."
-
-      - name: Publish APKs to GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: yggdrasil-jumper ${{ needs.check.outputs.version }} (OpenWrt 25.12)
+          generate_release_notes: true
           files: |
             release/*.apk
           fail_on_unmatched_files: true
-          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  skip:
+    name: No new stable release
+    needs: check
+    if: needs.check.outputs.build != 'true'
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Show status
+        run: |
+          echo "No new yggdrasil-jumper stable release needs to be built."
+          echo "Latest upstream: ${{ needs.check.outputs.version }}"
