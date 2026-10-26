@@ -190,19 +190,57 @@ jobs:
           git diff --check
           git diff -- "$makefile"
 
-      - name: Debug package Makefile
-        shell: bash
-        run: |
-          set -eu
-          echo "=== PKG_SOURCE_URL ==="
-          grep -n '^PKG_SOURCE_URL' yggdrasil-jumper/Makefile || true
 
-          echo "=== PKG_HASH ==="
-          grep -n '^PKG_HASH' yggdrasil-jumper/Makefile || true
+      - name: Validate package Makefile
+        shell: bash
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+
+          makefile="yggdrasil-jumper/Makefile"
+          test -f "$makefile" || {
+            echo "::error::Missing $makefile"
+            exit 1
+          }
 
           echo "=== Package metadata ==="
-          grep -nE '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_SOURCE|PKG_SOURCE_URL|PKG_HASH):=' \
-            yggdrasil-jumper/Makefile
+          grep -nE '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_SOURCE|PKG_SOURCE_URL|PKG_HASH):=' "$makefile" || true
+
+          check_line() {
+            local description="$1"
+            local pattern="$2"
+
+            if grep -Fqx -- "$pattern" "$makefile"; then
+              echo "OK: $description"
+            else
+              echo "::error::$description does not match"
+              echo "Expected: $pattern"
+              exit 1
+            fi
+          }
+
+          check_line "PKG_NAME" 'PKG_NAME:=yggdrasil-jumper'
+          check_line "PKG_VERSION" "PKG_VERSION:=${VERSION}"
+
+          if ! grep -Eq '^PKG_RELEASE:=[^[:space:]]+$' "$makefile"; then
+            echo "::error::PKG_RELEASE is missing or empty"
+            exit 1
+          fi
+          echo "OK: PKG_RELEASE"
+
+          if ! grep -Fqx 'PKG_SOURCE_URL:=https://codeload.github.com/one-d-wide/yggdrasil-jumper/tar.gz/v$(PKG_VERSION)?' "$makefile"; then
+            echo "::error::PKG_SOURCE_URL differs from the expected value"
+            exit 1
+          fi
+          echo "OK: PKG_SOURCE_URL"
+
+          hash="$(sed -n 's/^PKG_HASH:=//p' "$makefile" | head -n 1)"
+          if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::PKG_HASH must contain exactly 64 lowercase hexadecimal characters"
+            exit 1
+          fi
+          echo "OK: PKG_HASH format"
 
       - name: Commit updated Makefile
         id: commit
