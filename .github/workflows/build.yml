@@ -175,7 +175,7 @@ jobs:
           grep -q '^PKG_SOURCE_URL:=' "$makefile"
           grep -q '^PKG_HASH:=' "$makefile"
 
-          source_url="https://codeload.github.com/one-d-wide/yggdrasil-jumper/tar.gz/v${VERSION}?"
+          source_url='https://codeload.github.com/one-d-wide/yggdrasil-jumper/tar.gz/v$(PKG_VERSION)?'
 
           sed -i \
             -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" \
